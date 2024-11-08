@@ -1,0 +1,163 @@
+---
+title: "NYPD"
+output:
+  html_document: default
+  pdf_document: default
+date: "2024-10-20"
+---
+
+## Loading Packages
+Let's first start with loading the needed tidyverse package, along with some other ones
+```{r load packages}
+#install.packages("forecast")
+library(tidyverse)
+library(lubridate)
+#install.packages("chron")
+library(chron)
+library(sarima)
+library(forecast)
+library(tseries)
+library(tswge)
+```
+## Loading Dataset
+```{r read_csv}
+url_nypd <- 'https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD'
+
+nypd_dataset <- read.csv(url_nypd)
+
+summary(nypd_dataset)
+```
+## Data Transforming
+Okay this is telling me that some of the data are not in the right formats. I would like to do some analysis using date and time information. As a result I have to convert those into formats that make sense. So we should do that.
+
+I would like to know a bit more about the way the date data looks like so I can convert the characters into a date
+```{r check_format}
+nypd_dataset %>%
+  group_by(OCCUR_DATE, OCCUR_TIME) %>%
+  summarise()
+```
+Looks like what we have is month day year, with 24 hour time stamps. Let's see if we can convert these into recognized dates
+for this step I am using tricks suggested by these sources:
+https://www.statology.org/lubridate-convert-character-to-date/
+https://stackoverflow.com/questions/12034424/convert-hourminutesecond-hhmmss-string-to-proper-time-class
+```{r convert_format}
+nypd_dataset$OCCUR_DATE <- mdy(nypd_dataset$OCCUR_DATE)
+#nypd_dataset$OCCUR_TIME <- chron(times = nypd_dataset$OCCUR_TIME)
+nypd_dataset$OCCUR_TIME <- hms(nypd_dataset$OCCUR_TIME)
+nypd_dataset %>%
+  group_by(OCCUR_DATE, OCCUR_TIME) %>%
+  summarise()
+```
+Excellent, we now have these in the formats that make sense. Perhaps we can now see if we can visualize when these events occur at. 
+
+## EDA and visualizations
+We can first start with a density plot, this will give us a rather smooth shape of the large scale trend that is going on. For our purposes we can see this as a smoothed out histogram.
+
+```{r density_plot}
+ggplot(nypd_dataset, aes(x = OCCUR_DATE)) + geom_density()
+```
+Okay let's look at a finer granularity for the date information. FOr this its best to use a histogram with high bin numbers to see if we can spot seasonal trends in the date
+```{r histogram_plot}
+ggplot(nypd_dataset, aes(x = OCCUR_DATE)) + geom_histogram(bins = 500)
+```
+At this scale we can see the seasonal fluctuations in the shooting data according to NYPD, this makes sense because we already know that violent crime fluctuates with the season everywhere. What is interesting is that the long term fluctuations we see from the density plot appears to be mostly driven by the higher months rather than by the whole. In other words the shootings in high incident months shape the year by year trend. 
+
+So now let's do the same for the time of day:
+```{r density_plot_day}
+ggplot(nypd_dataset, aes(x = OCCUR_TIME)) + geom_density()
+```
+We can see that in general it appears that night time and before 8 am are the times when incidents are more common. Let's also do a histogram, however the granularity this case needs to be corser because at finer granularity we encounter the problem where time is no longer continuous (the data does not seem to be captured in that fine of a granularity, so we often end up having spikes around round numbers and stuff for time)
+```{r histogram_plot_date}
+ggplot(nypd_dataset, aes(x = OCCUR_TIME)) + geom_histogram(bins = 300)
+```
+
+Because we observe seasonal and time series fluctuations in the time of the event perhaps we can fit a time series model to the data? Especially good would be a time series model that can take into account seasonal fluctuations in the data as we have observed. 
+
+One such model that i think would work decently well is a SARIMA model, this is used for time series forecast where we observe seasonal fluctuations from the moving average and based on the EDA here it seems like not a bad choice.
+
+## Transforming Data 
+
+to use a SARIMA model we have to use a count by time system, so I would aggregate by the month. 
+
+Let's first start with turning the data into a daily incidents data:
+```{r aggregate}
+nypd_dataset_reduced <- nypd_dataset[-c(3:21)]
+nypd_dataset_incident_by_date <- aggregate(nypd_dataset_reduced , by = list(nypd_dataset_reduced$OCCUR_DATE) , length)
+
+```
+
+```{r plot}
+ggplot(nypd_dataset_incident_by_date, aes(x = Group.1, y = INCIDENT_KEY)) + geom_line()
+```
+Looks like that did it, let's now turn it into a monthly incident data
+```{r aggregate_to_month}
+nypd_dataset_incident_by_date$month <- floor_date(nypd_dataset_incident_by_date$Group.1, "month")
+
+nypd_dataset_incident_by_date = nypd_dataset_incident_by_date %>%
+  group_by(month) %>%
+  summarize(Sum = sum(INCIDENT_KEY))
+```
+
+```{r plot_to_month}
+nypd_dataset_incident_by_date
+ggplot(nypd_dataset_incident_by_date, aes(x = month, y = Sum)) + geom_line()
+```
+## Modeling
+
+cool beans let's start with turning the data into time series and conduct an Augmented Dickey-Fuller test to test for stationarity. The hypotheses are:
+
+$H_0$: The data is not stationary
+
+$H_1$: The data is stationary
+```{r sarima_model_statistical_test}
+ts_data <- ts(nypd_dataset_incident_by_date$Sum, frequency = 12)
+adf.test(ts_data)
+```
+
+For this step I will have R suggest a model and fit a model of my own and see which is better
+
+## Model Fitting and Diagnistics
+
+```{r sarima_fitting}
+auto_fit <- auto.arima(ts_data)
+#aic5.wge(ts_data, p = 1:3, q = 1:3, type = "aic")
+fit <- Arima(ts_data, order = c(1, 0, 0), seasonal = c(2, 3, 2), include.drift = TRUE)
+summary(auto_fit)
+summary(fit)
+```
+The model I selected actually has lower AIC from the looks, so we should probably go with my own model, but I am curious to see how different the models would do and predict.
+
+## More Visualizations
+
+Let's check the residuals to make sure that our residuals look like random noise (meaning that our model has fully captured the systematic part of the data)
+```{r sarima_fitting_vis}
+checkresiduals(auto_fit)
+checkresiduals(fit)
+```
+The above also contains a Ljung-Box test, for this test:
+
+$H_0$: The residuals are not correlated with each other
+
+$H_1$: The residuals are correlated with each other
+
+We actually reject the null for the autofit model, meaning that our residuals are not random white noise. I think this result can be attributed to the disruption caused by the covid 19 pandemic. The manually fitted model does not seem to have this issue. 
+
+The spike we see around 2020 and lasting a few years after can be attributed to the covid 19 pandemic, and that would not really be white noise. Something like the covid 19 pandemic would be considered an exogenous variable and it is possible to account for it in SARIMA by introducing a variable into the model that operationalizes the disruption caused by the covid 19 pandemic (and thus making our model SARIMAX.) That being said I do not currently posses a good variable that actually operationalizes the disruption that the pandemic brought. For example, if we use unemployment as the variable we can tell that after the 2008 financial crisis we did not see a spike in incidents. While unemployment did spike as a result of the lockdowns, it also did for 2008 and the results are not the same, so we can conclude that unemployment is likely not a good operationalization of the disruption caused by the pandemic. As a result I would have to note this lack of randomness in the residuals of the model as a deficiency of this model choice and move on. 
+
+based on this we are ready to use this model to then predict the incidents in the next 5 years:
+```{r sarima_forcasting}
+forecasts_auto_fit <- forecast(auto_fit, h = 60)
+plot(forecasts_auto_fit)
+forecasts_manual_fit <- forecast(fit, h = 60)
+plot(forecasts_manual_fit)
+```
+
+So looks like our model auto fitted is calling for the same seasonal fluctuations in the number of incidents, but a gradual year over year decrease going forward. Assuming an event like the covid 19 pandemic and lockdowns do not occur again this appears to be the general trend across the country since the 1990s. Our manually fitted model is saying a year over year increase going forwards while also having the seasonal trends. That being said I can say quite conclusively that the manually fitted model is likely false. Based on historical data violent crime in the US has been going down since the 1990s, and other than the spike caused by covid we still see a general reduction of violent crime across the country. Unless if some other factor changes the current trend I am inclined to believe that incidents will continue to go down into the future. But hey I don't have a crystal ball so I can only give my conjecture. 
+
+# Possible Source of Bias
+
+For this data I would like to point out the possibility of sampling bias, I would presume that the data was collected from police reports, meaning that it is based upon the assumption that the police investigated a case to log these information in. This introduces the possibility that not every case is logged in a police report, meaning this data could be an undercount of actual cases. In addition the extent of undercounting can fluctuate based on the number of incidents and how policing resources are spread out, as a result the extent of undercounting can vary and further change our data.
+
+Another point I would like to raise is the outlier we see as a result of the covid 19 pandemic. We can easily attribute the spike in incidents in 2020 and the subsequent years to the pandemic, but I do not have a good variable that specifically operationalize the disruption caused by the pandemic so this analysis did not include such a variable. The fact that the residuals are not random white noise according to the statistical test is rather concerning when it comes to how assessing the validity this forecast model is. I would be curious as to what would be a good variable for this though. 
+
+In terms of personal bias, I do not really have an interest in how the model prediction turns out, but I do have some domain knowledge about the topic. The results of this analysis and the results of the auto fitted model generally fits with my domain knowledge of the topic but there may be confirmation bias to an extent. I did do EDA and use the results of the EDA to inform my model selection and analysis so I believe that I have been reasonably evidence based in my approach. 
